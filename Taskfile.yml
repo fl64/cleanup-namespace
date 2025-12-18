@@ -1,0 +1,11 @@
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  BINARY: cleanup-namespace
+
+tasks:
+  default:
+    cmds:
+      - CGO_ENABLED=0 go build -ldflags="-s -w -extldflags=-static" -o {{ .BINARY }} .
