@@ -27,7 +27,9 @@ var rootCmd = &cobra.Command{
 	Short: "Cleanup all resources in a Kubernetes namespace",
 	Long: `Cleanup-ns removes all resources from a specified Kubernetes namespace.
 It handles finalizers and supports filtering resources by regex patterns.`,
-	RunE: runCleanup,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runCleanup,
 }
 
 func init() {
@@ -90,13 +92,14 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 
 	cleaner := cleanup.NewCleaner(clients, dryRun)
 	if err := cleaner.Cleanup(ctx, namespace, workers, includePatterns, excludePatterns); err != nil {
-		return fmt.Errorf("cleanup failed: %w", err)
+		fmt.Printf("\n⚠ %s\n", err)
+		return err
 	}
 
 	if dryRun {
 		fmt.Println("\nDry-run completed successfully (no resources were deleted)")
 	} else {
-		fmt.Println("\nCleanup completed successfully")
+		fmt.Println("\n✔ Cleanup completed successfully")
 	}
 	return nil
 }

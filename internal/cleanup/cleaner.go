@@ -162,6 +162,7 @@ func (c *Cleaner) Cleanup(ctx context.Context, namespace string, workers int, in
 
 	p.Wait()
 
+	var hasErrors bool
 	for _, resourceGroup := range allResourceInfos {
 		for _, info := range resourceGroup.Infos {
 			fmt.Printf("  %s/%s\n", resourceGroup.ResourceType, info.Name)
@@ -171,7 +172,31 @@ func (c *Cleaner) Cleanup(ctx context.Context, namespace string, workers int, in
 			if len(info.Finalizers) > 0 {
 				fmt.Printf("    finalizers -> %s\n", strings.Join(info.Finalizers, "; "))
 			}
+			if len(info.Errors) > 0 {
+				hasErrors = true
+			}
 		}
+	}
+
+	var errorCount int
+	if hasErrors {
+		fmt.Println("\n⚠ Errors encountered during cleanup:")
+		for _, resourceGroup := range allResourceInfos {
+			for _, info := range resourceGroup.Infos {
+				if len(info.Errors) == 0 {
+					continue
+				}
+				errorCount++
+				fmt.Printf("  ✗ %s/%s\n", resourceGroup.ResourceType, info.Name)
+				for _, e := range info.Errors {
+					fmt.Printf("      %s\n", e)
+				}
+			}
+		}
+	}
+
+	if errorCount > 0 {
+		return fmt.Errorf("cleanup completed with errors: %d resource(s) had problems", errorCount)
 	}
 
 	return nil
@@ -253,6 +278,7 @@ type ResourceInfo struct {
 	Name       string
 	OwnerRefs  []string
 	Finalizers []string
+	Errors     []string
 }
 
 func (c *Cleaner) cleanupResourceType(ctx context.Context, namespace string, gvr schema.GroupVersionResource, workers int, stats *Stats, p *mpb.Progress, resourceTypeName string) (int, []ResourceInfo, error) {
@@ -345,18 +371,12 @@ func (c *Cleaner) deleteResource(ctx context.Context, namespace string, gvr sche
 		info.Finalizers = finalizers
 	}
 
-	infoCh <- info
-
 	if dryRun {
+		infoCh <- info
 		return nil
 	}
 
-	current, getErr := resourceClient.Get(ctx, name, metav1.GetOptions{})
-	if getErr == nil && len(current.GetFinalizers()) > 0 {
-		current.SetFinalizers([]string{})
-		_, _ = resourceClient.Update(ctx, current, metav1.UpdateOptions{})
-	}
-
+	// Попытка снять финалайзеры: сначала Update, если не получилось — Patch (fallback)
 	patch := []map[string]interface{}{
 		{
 			"op":   "remove",
@@ -364,24 +384,65 @@ func (c *Cleaner) deleteResource(ctx context.Context, namespace string, gvr sche
 		},
 	}
 	patchBytes, _ := json.Marshal(patch)
-	_, _ = resourceClient.Patch(ctx, name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
 
+	errSet := make(map[string]struct{})
+	addError := func(msg string) {
+		if _, exists := errSet[msg]; !exists {
+			errSet[msg] = struct{}{}
+			info.Errors = append(info.Errors, msg)
+		}
+	}
+
+	// Попытка снять финалайзеры: Update, затем Patch как fallback
+	finalizersRemoved := false
+	current, getErr := resourceClient.Get(ctx, name, metav1.GetOptions{})
+	if getErr == nil && len(current.GetFinalizers()) > 0 {
+		current.SetFinalizers([]string{})
+		if _, err := resourceClient.Update(ctx, current, metav1.UpdateOptions{}); err == nil {
+			finalizersRemoved = true
+		} else {
+			if !isNotFoundError(err) {
+				addError(err.Error())
+			}
+			if _, patchErr := resourceClient.Patch(ctx, name, types.JSONPatchType, patchBytes, metav1.PatchOptions{}); patchErr == nil {
+				finalizersRemoved = true
+			} else if !isNotFoundError(patchErr) {
+				addError(patchErr.Error())
+			}
+		}
+	}
+
+	// Удаление ресурса
 	gracePeriod := int64(0)
 	deleteErr := resourceClient.Delete(ctx, name, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,
 	})
+	if deleteErr != nil && !isNotFoundError(deleteErr) {
+		addError(deleteErr.Error())
+	}
 
-	_, _ = resourceClient.Patch(ctx, name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
-
-	if deleteErr != nil {
-		errStr := deleteErr.Error()
-		isNotFound := strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "NotFound") ||
-			strings.Contains(errStr, "not found")
-		if !isNotFound {
-			return fmt.Errorf("failed to delete %s/%s: %w", gvr.Resource, name, deleteErr)
+	// Повторная попытка снять финалайзеры после удаления
+	if !finalizersRemoved {
+		if _, err := resourceClient.Patch(ctx, name, types.JSONPatchType, patchBytes, metav1.PatchOptions{}); err != nil {
+			if !isNotFoundError(err) {
+				addError(err.Error())
+			}
 		}
 	}
 
+	infoCh <- info
+
+	if deleteErr != nil && !isNotFoundError(deleteErr) {
+		return fmt.Errorf("failed to delete %s/%s: %w", gvr.Resource, name, deleteErr)
+	}
+
 	return nil
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "NotFound")
 }
