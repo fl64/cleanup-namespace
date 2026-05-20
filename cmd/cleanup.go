@@ -92,7 +92,6 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 
 	cleaner := cleanup.NewCleaner(clients, dryRun)
 	if err := cleaner.Cleanup(ctx, namespace, workers, includePatterns, excludePatterns); err != nil {
-		fmt.Printf("\n⚠ %s\n", err)
 		return err
 	}
 

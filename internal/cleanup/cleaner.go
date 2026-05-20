@@ -10,6 +10,7 @@ import (
 
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -43,7 +44,10 @@ func NewCleaner(clients *client.Clients, dryRun bool) *Cleaner {
 func NamespaceExists(ctx context.Context, clients *client.Clients, namespace string) (bool, error) {
 	_, err := clients.Kubernetes.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 	if err != nil {
-		return false, nil
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }
@@ -117,7 +121,7 @@ func (c *Cleaner) Cleanup(ctx context.Context, namespace string, workers int, in
 	overallBar, _ := p.Add(int64(len(filteredResources)),
 		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding("-").Rbound("]").Build(),
 		mpb.PrependDecorators(
-			decor.Name("Resource types", decor.WC{W: 20, C: decor.DSyncWidth}),
+			decor.Name("Scanned types", decor.WC{W: 20, C: decor.DSyncWidth}),
 			decor.CountersNoUnit("%d / %d", decor.WC{W: 10, C: decor.DSyncWidth}),
 		),
 		mpb.AppendDecorators(
@@ -131,10 +135,8 @@ func (c *Cleaner) Cleanup(ctx context.Context, namespace string, workers int, in
 	}
 	var allResourceInfos []ResourceGroup
 
-	var resourceTypesProcessed int
 	var overallErrors []error
 	for _, apiRes := range filteredResources {
-		resourceTypesProcessed++
 		resourceTypeName := c.formatResourceTypeName(apiRes)
 
 		typeStats, resourceInfos, err := c.cleanupResourceType(ctx, namespace, apiRes, workers, stats, p, resourceTypeName)
@@ -197,6 +199,9 @@ func (c *Cleaner) Cleanup(ctx context.Context, namespace string, workers int, in
 
 	if errorCount > 0 {
 		return fmt.Errorf("cleanup completed with errors: %d resource(s) had problems", errorCount)
+	}
+	if len(overallErrors) > 0 {
+		return fmt.Errorf("cleanup completed with errors: %d resource type(s) failed; first error: %w", len(overallErrors), overallErrors[0])
 	}
 
 	return nil
@@ -327,9 +332,11 @@ func (c *Cleaner) cleanupResourceType(ctx context.Context, namespace string, gvr
 				errors = append(errors, fmt.Errorf("failed to delete %s: %w", resource.GetName(), err))
 				mu.Unlock()
 			} else {
-				mu.Lock()
-				deletedCount++
-				mu.Unlock()
+				if !c.dryRun {
+					mu.Lock()
+					deletedCount++
+					mu.Unlock()
+				}
 			}
 
 			resourceBar.Increment()
@@ -443,6 +450,5 @@ func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "NotFound")
+	return apierrors.IsNotFound(err)
 }
