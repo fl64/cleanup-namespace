@@ -9,3 +9,8 @@ tasks:
   default:
     cmds:
       - CGO_ENABLED=0 go build -ldflags="-s -w -extldflags=-static" -o {{ .BINARY }} .
+  install:
+    deps:
+    - default
+    cmds:
+      - sudo cp {{ .BINARY }} /usr/local/bin/{{ .BINARY }}
